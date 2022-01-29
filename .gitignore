@@ -49,3 +49,6 @@ screenshots
 .idea
 .better_test.db
 /.pytest_cache/
+*.orig
+*.rej
+*.patch
