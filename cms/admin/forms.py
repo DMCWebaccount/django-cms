@@ -1,4 +1,44 @@
 # -*- coding: utf-8 -*-
+from cms import api
+from cms.apphook_pool import apphook_pool
+from cms.cache.permissions import clear_permission_cache
+from cms.constants import PAGE_TYPES_ID, PUBLISHER_STATE_DIRTY, ROOT_USER_LEVEL
+from cms.exceptions import PluginLimitReached
+from cms.extensions import extension_pool
+from cms.forms.validators import (
+    validate_relative_url,
+    validate_url_uniqueness,
+    validate_overwrite_url,
+)
+from cms.forms.widgets import (
+    UserSelectAdminWidget,
+    AppHookSelect,
+    ApplicationConfigSelect,
+)
+from cms.models import (
+    CMSPlugin,
+    Page,
+    PageType,
+    PagePermission,
+    PageUser,
+    PageUserGroup,
+    Title,
+    Placeholder,
+    GlobalPagePermission,
+    TreeNode,
+)
+from cms.models.permissionmodels import User
+from cms.plugin_pool import plugin_pool
+from cms.signals.apphook import set_restart_trigger
+from cms.utils.compat.forms import UserChangeForm
+from cms.utils.conf import get_cms_setting
+from cms.utils.i18n import get_language_list, get_language_object
+from cms.utils.permissions import (
+    get_current_user,
+    get_subordinate_users,
+    get_subordinate_groups,
+    get_user_permission_level,
+)
 from django import forms
 from django.apps import apps
 from django.contrib.auth import get_user_model, get_permission_codename
@@ -11,39 +51,22 @@ from django.forms.widgets import HiddenInput
 from django.template.defaultfilters import slugify
 from django.utils.encoding import force_text
 from django.utils.translation import ugettext, ugettext_lazy as _
-
-from cms import api
-from cms.apphook_pool import apphook_pool
-from cms.cache.permissions import clear_permission_cache
-from cms.exceptions import PluginLimitReached
-from cms.extensions import extension_pool
-from cms.constants import PAGE_TYPES_ID, PUBLISHER_STATE_DIRTY, ROOT_USER_LEVEL
-from cms.forms.validators import validate_relative_url, validate_url_uniqueness
-from cms.forms.widgets import UserSelectAdminWidget, AppHookSelect, ApplicationConfigSelect
-from cms.models import (CMSPlugin, Page, PageType, PagePermission, PageUser, PageUserGroup, Title,
-                        Placeholder, GlobalPagePermission, TreeNode)
-from cms.models.permissionmodels import User
-from cms.plugin_pool import plugin_pool
-from cms.signals.apphook import set_restart_trigger
-from cms.utils.conf import get_cms_setting
-from cms.utils.compat.forms import UserChangeForm
-from cms.utils.i18n import get_language_list, get_language_object
-from cms.utils.permissions import (
-    get_current_user,
-    get_subordinate_users,
-    get_subordinate_groups,
-    get_user_permission_level,
-)
 from menus.menu_pool import menu_pool
 
 
 def get_permission_accessor(obj):
     User = get_user_model()
 
-    if isinstance(obj, (PageUser, User,)):
-        rel_name = 'user_permissions'
+    if isinstance(
+        obj,
+        (
+            PageUser,
+            User,
+        ),
+    ):
+        rel_name = "user_permissions"
     else:
-        rel_name = 'permissions'
+        rel_name = "permissions"
     return getattr(obj, rel_name)
 
 
@@ -52,33 +75,31 @@ def get_page_changed_by_filter_choices():
     # Been like this forever
     # Would be nice for it to filter out by site
     values = (
-        Page
-        .objects
-        .filter(publisher_is_draft=True)
+        Page.objects.filter(publisher_is_draft=True)
         .distinct()
-        .order_by('changed_by')
-        .values_list('changed_by', flat=True)
+        .order_by("changed_by")
+        .values_list("changed_by", flat=True)
     )
 
-    yield ('', _('All'))
+    yield ("", _("All"))
 
     for value in values:
         yield (value, value)
 
 
 def get_page_template_filter_choices():
-    yield ('', _('All'))
+    yield ("", _("All"))
 
-    for value, name in get_cms_setting('TEMPLATES'):
+    for value, name in get_cms_setting("TEMPLATES"):
         yield (value, name)
 
 
 def save_permissions(data, obj):
     models = (
-        (Page, 'page'),
-        (PageUser, 'pageuser'),
-        (PageUserGroup, 'pageuser'),
-        (PagePermission, 'pagepermission'),
+        (Page, "page"),
+        (PageUser, "pageuser"),
+        (PageUserGroup, "pageuser"),
+        (PagePermission, "pagepermission"),
     )
 
     if not obj.pk:
@@ -89,11 +110,13 @@ def save_permissions(data, obj):
 
     for model, name in models:
         content_type = ContentType.objects.get_for_model(model)
-        for key in ('add', 'change', 'delete'):
+        for key in ("add", "change", "delete"):
             # add permission `key` for model `model`
             codename = get_permission_codename(key, model._meta)
-            permission = Permission.objects.get(content_type=content_type, codename=codename)
-            field = 'can_%s_%s' % (key, name)
+            permission = Permission.objects.get(
+                content_type=content_type, codename=codename
+            )
+            field = "can_%s_%s" % (key, name)
 
             if data.get(field):
                 permission_accessor.add(permission)
@@ -105,8 +128,9 @@ class CopyPermissionForm(forms.Form):
     """
     Holds the specific field for permissions
     """
+
     copy_permissions = forms.BooleanField(
-        label=_('Copy permissions'),
+        label=_("Copy permissions"),
         required=False,
         initial=True,
     )
@@ -117,26 +141,46 @@ class BasePageForm(forms.ModelForm):
     _site = None
     _language = None
 
-    title = forms.CharField(label=_("Title"), max_length=255, widget=forms.TextInput(),
-                            help_text=_('The default title'))
-    slug = forms.CharField(label=_("Slug"), max_length=255, widget=forms.TextInput(),
-                           help_text=_('The part of the title that is used in the URL'))
-    menu_title = forms.CharField(label=_("Menu Title"), widget=forms.TextInput(),
-                                 help_text=_('Overwrite what is displayed in the menu'), required=False)
-    page_title = forms.CharField(label=_("Page Title"), widget=forms.TextInput(),
-                                 help_text=_('Overwrites what is displayed at the top of your browser or in bookmarks'),
-                                 required=False)
-    meta_description = forms.CharField(label=_('Description meta tag'), required=False,
-                                       widget=forms.Textarea(attrs={'maxlength': '320', 'rows': '4'}),
-                                       help_text=_('A description of the page used by search engines.'),
-                                       max_length=320)
+    title = forms.CharField(
+        label=_("Title"),
+        max_length=255,
+        widget=forms.TextInput(),
+        help_text=_("The default title"),
+    )
+    slug = forms.CharField(
+        label=_("Slug"),
+        max_length=255,
+        widget=forms.TextInput(),
+        help_text=_("The part of the title that is used in the URL"),
+    )
+    menu_title = forms.CharField(
+        label=_("Menu Title"),
+        widget=forms.TextInput(),
+        help_text=_("Overwrite what is displayed in the menu"),
+        required=False,
+    )
+    page_title = forms.CharField(
+        label=_("Page Title"),
+        widget=forms.TextInput(),
+        help_text=_(
+            "Overwrites what is displayed at the top of your browser or in bookmarks"
+        ),
+        required=False,
+    )
+    meta_description = forms.CharField(
+        label=_("Description meta tag"),
+        required=False,
+        widget=forms.Textarea(attrs={"maxlength": "320", "rows": "4"}),
+        help_text=_("A description of the page used by search engines."),
+        max_length=320,
+    )
 
     class Meta:
         model = Page
         fields = []
 
     def clean_slug(self):
-        slug = slugify(self.cleaned_data['slug'])
+        slug = slugify(self.cleaned_data["slug"])
 
         if not slug:
             raise ValidationError(_("Slug must not be empty."))
@@ -145,7 +189,7 @@ class BasePageForm(forms.ModelForm):
 
 class AddPageForm(BasePageForm):
     source = forms.ModelChoiceField(
-        label=_(u'Page type'),
+        label=_(u"Page type"),
         queryset=Page.objects.filter(
             is_page_type=True,
             publisher_is_draft=True,
@@ -160,12 +204,12 @@ class AddPageForm(BasePageForm):
 
     class Meta:
         model = Page
-        fields = ['source']
+        fields = ["source"]
 
     def __init__(self, *args, **kwargs):
         super(AddPageForm, self).__init__(*args, **kwargs)
 
-        source_field = self.fields.get('source')
+        source_field = self.fields.get("source")
 
         if not source_field or source_field.widget.is_hidden:
             return
@@ -176,7 +220,7 @@ class AddPageForm(BasePageForm):
             # Set the choicefield's choices to the various page_types
             descendants = root_page.get_descendant_pages().filter(is_page_type=True)
             titles = Title.objects.filter(page__in=descendants, language=self._language)
-            choices = [('', '---------')]
+            choices = [("", "---------")]
             choices.extend((title.page_id, title.title) for title in titles)
             source_field.choices = choices
         else:
@@ -193,14 +237,14 @@ class AddPageForm(BasePageForm):
             # addressed first.
             return data
 
-        parent_node = data.get('parent_node')
+        parent_node = data.get("parent_node")
 
         if parent_node:
-            slug = data['slug']
+            slug = data["slug"]
             parent_path = parent_node.item.get_path(self._language)
-            path = u'%s/%s' % (parent_path, slug) if parent_path else slug
+            path = u"%s/%s" % (parent_path, slug) if parent_path else slug
         else:
-            path = data['slug']
+            path = data["slug"]
 
         try:
             # Validate the url
@@ -210,13 +254,13 @@ class AddPageForm(BasePageForm):
                 language=self._language,
             )
         except ValidationError as error:
-            self.add_error('slug', error)
+            self.add_error("slug", error)
         else:
-            data['path'] = path
+            data["path"] = path
         return data
 
     def clean_parent_node(self):
-        parent_node = self.cleaned_data.get('parent_node')
+        parent_node = self.cleaned_data.get("parent_node")
 
         if parent_node and parent_node.site_id != self._site.pk:
             raise ValidationError("Site doesn't match the parent's page site")
@@ -225,21 +269,21 @@ class AddPageForm(BasePageForm):
     def create_translation(self, page):
         data = self.cleaned_data
         title_kwargs = {
-            'page': page,
-            'language': self._language,
-            'slug': data['slug'],
-            'path': data['path'],
-            'title': data['title'],
+            "page": page,
+            "language": self._language,
+            "slug": data["slug"],
+            "path": data["path"],
+            "title": data["title"],
         }
 
-        if 'menu_title' in data:
-            title_kwargs['menu_title'] = data['menu_title']
+        if "menu_title" in data:
+            title_kwargs["menu_title"] = data["menu_title"]
 
-        if 'page_title' in data:
-            title_kwargs['page_title'] = data['page_title']
+        if "page_title" in data:
+            title_kwargs["page_title"] = data["page_title"]
 
-        if 'meta_description' in data:
-            title_kwargs['meta_description'] = data['meta_description']
+        if "meta_description" in data:
+            title_kwargs["meta_description"] = data["meta_description"]
         return api.create_title(**title_kwargs)
 
     def from_source(self, source, parent=None):
@@ -258,8 +302,8 @@ class AddPageForm(BasePageForm):
         return Page.TEMPLATE_DEFAULT
 
     def save(self, *args, **kwargs):
-        source = self.cleaned_data.get('source')
-        parent = self.cleaned_data.get('parent_node')
+        source = self.cleaned_data.get("source")
+        parent = self.cleaned_data.get("parent_node")
 
         if source:
             new_page = self.from_source(source, parent=parent)
@@ -269,7 +313,7 @@ class AddPageForm(BasePageForm):
         else:
             new_page = super(AddPageForm, self).save(commit=False)
             new_page.template = self.get_template()
-            new_page.set_tree_node(self._site, target=parent, position='last-child')
+            new_page.set_tree_node(self._site, target=parent, position="last-child")
             new_page.save()
 
         translation = self.create_translation(new_page)
@@ -282,9 +326,7 @@ class AddPageForm(BasePageForm):
             )
 
         is_first = not (
-            TreeNode
-            .objects
-            .get_for_site(self._site)
+            TreeNode.objects.get_for_site(self._site)
             .exclude(pk=new_page.node_id)
             .exists()
         )
@@ -328,7 +370,7 @@ class AddPageTypeForm(AddPageForm):
         if not root_page.has_translation(self._language):
             api.create_title(
                 language=self._language,
-                title=ugettext('Page Types'),
+                title=ugettext("Page Types"),
                 page=root_page,
                 slug=PAGE_TYPES_ID,
                 path=PAGE_TYPES_ID,
@@ -362,7 +404,7 @@ class AddPageTypeForm(AddPageForm):
     def save(self, *args, **kwargs):
         new_page = super(AddPageTypeForm, self).save(*args, **kwargs)
 
-        if not self.cleaned_data.get('source'):
+        if not self.cleaned_data.get("source"):
             # User has created a page-type via "Add page"
             # instead of from another page.
             new_page.update(
@@ -384,11 +426,11 @@ class DuplicatePageForm(AddPageForm):
 class ChangePageForm(BasePageForm):
 
     translation_fields = (
-        'slug',
-        'title',
-        'meta_description',
-        'menu_title',
-        'page_title',
+        "slug",
+        "title",
+        "meta_description",
+        "menu_title",
+        "page_title",
     )
 
     def __init__(self, *args, **kwargs):
@@ -414,25 +456,25 @@ class ChangePageForm(BasePageForm):
         page = self.instance
 
         if page.is_home:
-            data['path'] = ''
+            data["path"] = ""
             return data
 
         if self.title_obj.has_url_overwrite:
-            data['path'] = self.title_obj.path
+            data["path"] = self.title_obj.path
             return data
 
-        if 'slug' not in self.fields:
+        if "slug" not in self.fields:
             # the {% edit_title_fields %} template tag
             # allows users to edit specific fields for a translation.
             # as a result, slug might not always be there.
             return data
 
         if page.parent_page:
-            slug = data['slug']
+            slug = data["slug"]
             parent_path = page.parent_page.get_path(self._language)
-            path = u'%s/%s' % (parent_path, slug) if parent_path else slug
+            path = u"%s/%s" % (parent_path, slug) if parent_path else slug
         else:
-            path = data['slug']
+            path = data["slug"]
 
         try:
             # Validate the url
@@ -443,29 +485,28 @@ class ChangePageForm(BasePageForm):
                 exclude_page=page,
             )
         except ValidationError as error:
-            self.add_error('slug', error)
+            self.add_error("slug", error)
         else:
-            data['path'] = path
+            data["path"] = path
         return data
 
     def save(self, commit=True):
         data = self.cleaned_data
         cms_page = super(ChangePageForm, self).save(commit=False)
 
-        translation_data = {field: data[field]
-                            for field in self.translation_fields if field in data}
+        translation_data = {
+            field: data[field] for field in self.translation_fields if field in data
+        }
 
-        if 'path' in data:
+        if "path" in data:
             # The path key is set if
             # the slug field is present in the form,
             # or if the page being edited is the home page,
             # or if the translation has a url override.
-            translation_data['path'] = data['path']
+            translation_data["path"] = data["path"]
 
         update_count = cms_page.update_translations(
-            self._language,
-            publisher_state=PUBLISHER_STATE_DIRTY,
-            **translation_data
+            self._language, publisher_state=PUBLISHER_STATE_DIRTY, **translation_data
         )
 
         if self._language in cms_page.title_cache:
@@ -480,10 +521,9 @@ class ChangePageForm(BasePageForm):
 
 
 class PublicationDatesForm(forms.ModelForm):
-
     class Meta:
         model = Page
-        fields = ['publication_date', 'publication_end_date']
+        fields = ["publication_date", "publication_end_date"]
 
     def save(self, *args, **kwargs):
         page = super(PublicationDatesForm, self).save(*args, **kwargs)
@@ -498,49 +538,78 @@ class AdvancedSettingsForm(forms.ModelForm):
     _site = None
     _language = None
 
-    application_urls = forms.ChoiceField(label=_('Application'),
-                                         choices=(), required=False,
-                                         help_text=_('Hook application to this page.'))
-    overwrite_url = forms.CharField(label=_('Overwrite URL'), max_length=255, required=False,
-                                    help_text=_('Keep this field empty if standard path should be used.'))
-
-    xframe_options = forms.ChoiceField(
-        choices=Page._meta.get_field('xframe_options').choices,
-        label=_('X Frame Options'),
-        help_text=_('Whether this page can be embedded in other pages or websites'),
-        initial=Page._meta.get_field('xframe_options').default,
-        required=False
+    application_urls = forms.ChoiceField(
+        label=_("Application"),
+        choices=(),
+        required=False,
+        help_text=_("Hook application to this page."),
+    )
+    overwrite_url = forms.CharField(
+        label=_("Overwrite URL"),
+        max_length=255,
+        required=False,
+        help_text=_("Keep this field empty if standard path should be used."),
     )
 
-    redirect = PageSmartLinkField(label=_('Redirect'), required=False,
-                                  help_text=_('Redirects to this URL.'),
-                                  placeholder_text=_('Start typing...'),
-                                  ajax_view='admin:cms_page_get_published_pagelist',
+    xframe_options = forms.ChoiceField(
+        choices=Page._meta.get_field("xframe_options").choices,
+        label=_("X Frame Options"),
+        help_text=_("Whether this page can be embedded in other pages or websites"),
+        initial=Page._meta.get_field("xframe_options").default,
+        required=False,
+    )
+
+    redirect = PageSmartLinkField(
+        label=_("Redirect"),
+        required=False,
+        help_text=_("Redirects to this URL."),
+        placeholder_text=_("Start typing..."),
+        ajax_view="admin:cms_page_get_published_pagelist",
     )
 
     # This is really a 'fake' field which does not correspond to any Page attribute
     # But creates a stub field to be populate by js
     application_configs = forms.CharField(
-        label=_('Application configurations'),
+        label=_("Application configurations"),
         required=False,
         widget=ApplicationConfigSelect,
     )
     fieldsets = (
-        (None, {
-            'fields': ('overwrite_url', 'redirect'),
-        }),
-        (_('Language independent options'), {
-            'fields': ('template', 'reverse_id', 'soft_root', 'navigation_extenders',
-                       'application_urls', 'application_namespace', 'application_configs',
-                       'xframe_options',)
-        })
+        (
+            None,
+            {
+                "fields": ("overwrite_url", "redirect"),
+            },
+        ),
+        (
+            _("Language independent options"),
+            {
+                "fields": (
+                    "template",
+                    "reverse_id",
+                    "soft_root",
+                    "navigation_extenders",
+                    "application_urls",
+                    "application_namespace",
+                    "application_configs",
+                    "xframe_options",
+                )
+            },
+        ),
     )
 
     class Meta:
         model = Page
         fields = [
-            'template', 'reverse_id', 'overwrite_url', 'redirect', 'soft_root', 'navigation_extenders',
-            'application_urls', 'application_namespace', "xframe_options",
+            "template",
+            "reverse_id",
+            "overwrite_url",
+            "redirect",
+            "soft_root",
+            "navigation_extenders",
+            "application_urls",
+            "application_namespace",
+            "xframe_options",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -551,11 +620,12 @@ class AdvancedSettingsForm(forms.ModelForm):
             force_reload=True,
         )
 
-        if 'navigation_extenders' in self.fields:
+        if "navigation_extenders" in self.fields:
             navigation_extenders = self.get_navigation_extenders()
-            self.fields['navigation_extenders'].widget = forms.Select(
-                {}, [('', "---------")] + navigation_extenders)
-        if 'application_urls' in self.fields:
+            self.fields["navigation_extenders"].widget = forms.Select(
+                {}, [("", "---------")] + navigation_extenders
+            )
+        if "application_urls" in self.fields:
             # Prepare a dict mapping the apps by class name ('PollApp') to
             # their app_name attribute ('polls'), if any.
             app_namespaces = {}
@@ -567,38 +637,46 @@ class AdvancedSettingsForm(forms.ModelForm):
                 if app.app_config:
                     app_configs[hook[0]] = app
 
-            self.fields['application_urls'].widget = AppHookSelect(
-                attrs={'id': 'application_urls'},
-                app_namespaces=app_namespaces
+            self.fields["application_urls"].widget = AppHookSelect(
+                attrs={"id": "application_urls"}, app_namespaces=app_namespaces
             )
-            self.fields['application_urls'].choices = [('', "---------")] + apphook_pool.get_apphooks()
+            self.fields["application_urls"].choices = [
+                ("", "---------")
+            ] + apphook_pool.get_apphooks()
 
             page_data = self.data if self.data else self.initial
             if app_configs:
-                self.fields['application_configs'].widget = ApplicationConfigSelect(
-                    attrs={'id': 'application_configs'},
+                self.fields["application_configs"].widget = ApplicationConfigSelect(
+                    attrs={"id": "application_configs"},
                     app_configs=app_configs,
                 )
 
-                if page_data.get('application_urls', False) and page_data['application_urls'] in app_configs:
-                    configs = app_configs[page_data['application_urls']].get_configs()
-                    self.fields['application_configs'].widget.choices = [(config.pk, force_text(config)) for config in configs]
+                if (
+                    page_data.get("application_urls", False)
+                    and page_data["application_urls"] in app_configs
+                ):
+                    configs = app_configs[page_data["application_urls"]].get_configs()
+                    self.fields["application_configs"].widget.choices = [
+                        (config.pk, force_text(config)) for config in configs
+                    ]
 
                     try:
-                        config = configs.get(namespace=self.initial['application_namespace'])
-                        self.fields['application_configs'].initial = config.pk
+                        config = configs.get(
+                            namespace=self.initial["application_namespace"]
+                        )
+                        self.fields["application_configs"].initial = config.pk
                     except ObjectDoesNotExist:
                         # Provided apphook configuration doesn't exist (anymore),
                         # just skip it
                         # The user will choose another value anyway
                         pass
 
-        if 'redirect' in self.fields:
-            self.fields['redirect'].widget.language = self._language
-            self.fields['redirect'].initial = self.title_obj.redirect
+        if "redirect" in self.fields:
+            self.fields["redirect"].widget.language = self._language
+            self.fields["redirect"].initial = self.title_obj.redirect
 
-        if 'overwrite_url' in self.fields and self.title_obj.has_url_overwrite:
-            self.fields['overwrite_url'].initial = self.title_obj.path
+        if "overwrite_url" in self.fields and self.title_obj.has_url_overwrite:
+            self.fields["overwrite_url"].initial = self.title_obj.path
 
     def get_apphooks(self):
         for hook in apphook_pool.get_apphooks():
@@ -611,12 +689,27 @@ class AdvancedSettingsForm(forms.ModelForm):
         return menu_pool.get_menus_by_attribute("cms_enabled", True)
 
     def _check_unique_namespace_instance(self, namespace):
-        return Page.objects.drafts().on_site(self._site).filter(
-            application_namespace=namespace
-        ).exclude(pk=self.instance.pk).exists()
+        return (
+            Page.objects.drafts()
+            .on_site(self._site)
+            .filter(application_namespace=namespace)
+            .exclude(pk=self.instance.pk)
+            .exists()
+        )
 
     def clean(self):
         cleaned_data = super(AdvancedSettingsForm, self).clean()
+
+        if cleaned_data.get("overwrite_url"):
+            # Assuming that the user enters a full URL in the overwrite_url input.
+            # Here we validate it before publishing the page and if it contains
+            # reserved characters (e.g. $?:#), we add error in the form.
+            # issue 6934
+            url = cleaned_data.get("overwrite_url")
+            if url and not validate_overwrite_url(value=url):
+                self._errors["overwrite_url"] = self.error_class(
+                    [_("You entered an invalid URL.")]
+                )
 
         if self._errors:
             # Fail fast if there's errors in the form
@@ -627,28 +720,35 @@ class AdvancedSettingsForm(forms.ModelForm):
         language_name = get_language_object(
             self._language,
             site_id=self._site.pk,
-        )['name']
+        )["name"]
 
         if not self.title_obj.slug:
             # This covers all cases where users try to edit
             # page advanced settings without setting a title slug
             # for page titles that already exist.
-            message = _("Please set the %(language)s slug "
-                        "before editing its advanced settings.")
-            raise ValidationError(message % {'language': language_name})
+            message = _(
+                "Please set the %(language)s slug "
+                "before editing its advanced settings."
+            )
+            raise ValidationError(message % {"language": language_name})
 
-        if 'reverse_id' in self.fields:
-            reverse_id = cleaned_data['reverse_id']
+        if "reverse_id" in self.fields:
+            reverse_id = cleaned_data["reverse_id"]
             if reverse_id:
-                lookup = Page.objects.drafts().on_site(self._site).filter(reverse_id=reverse_id)
+                lookup = (
+                    Page.objects.drafts()
+                    .on_site(self._site)
+                    .filter(reverse_id=reverse_id)
+                )
                 if lookup.exclude(pk=self.instance.pk).exists():
-                    self._errors['reverse_id'] = self.error_class(
-                        [_('A page with this reverse URL id exists already.')])
-        apphook = cleaned_data.get('application_urls', None)
+                    self._errors["reverse_id"] = self.error_class(
+                        [_("A page with this reverse URL id exists already.")]
+                    )
+        apphook = cleaned_data.get("application_urls", None)
         # The field 'application_namespace' is a misnomer. It should be
         # 'instance_namespace'.
-        instance_namespace = cleaned_data.get('application_namespace', None)
-        application_config = cleaned_data.get('application_configs', None)
+        instance_namespace = cleaned_data.get("application_namespace", None)
+        application_config = cleaned_data.get("application_configs", None)
         if apphook:
             apphooks_with_config = self.get_apphooks_with_config()
 
@@ -658,35 +758,47 @@ class AdvancedSettingsForm(forms.ModelForm):
                 # the 'usual' namespace field to be backward compatible
                 # with existing apphooks
                 try:
-                    appconfig_pk = forms.IntegerField(required=True).to_python(application_config)
+                    appconfig_pk = forms.IntegerField(required=True).to_python(
+                        application_config
+                    )
                 except ValidationError:
-                    self._errors['application_configs'] = ErrorList([
-                        _('Invalid application config value')
-                    ])
+                    self._errors["application_configs"] = ErrorList(
+                        [_("Invalid application config value")]
+                    )
                     return self.cleaned_data
 
                 try:
-                    config = apphooks_with_config[apphook].get_configs().get(pk=appconfig_pk)
+                    config = (
+                        apphooks_with_config[apphook].get_configs().get(pk=appconfig_pk)
+                    )
                 except ObjectDoesNotExist:
-                    self._errors['application_configs'] = ErrorList([
-                        _('Invalid application config value')
-                    ])
+                    self._errors["application_configs"] = ErrorList(
+                        [_("Invalid application config value")]
+                    )
                     return self.cleaned_data
 
                 if self._check_unique_namespace_instance(config.namespace):
                     # Looks like there's already one with the default instance
                     # namespace defined.
-                    self._errors['application_configs'] = ErrorList([
-                        _('An application instance using this configuration already exists.')
-                    ])
+                    self._errors["application_configs"] = ErrorList(
+                        [
+                            _(
+                                "An application instance using this configuration already exists."
+                            )
+                        ]
+                    )
                 else:
-                    self.cleaned_data['application_namespace'] = config.namespace
+                    self.cleaned_data["application_namespace"] = config.namespace
             else:
                 if instance_namespace:
                     if self._check_unique_namespace_instance(instance_namespace):
-                        self._errors['application_namespace'] = ErrorList([
-                            _('An application instance with this name already exists.')
-                        ])
+                        self._errors["application_namespace"] = ErrorList(
+                            [
+                                _(
+                                    "An application instance with this name already exists."
+                                )
+                            ]
+                        )
                 else:
                     # The attribute on the apps 'app_name' is a misnomer, it should be
                     # 'application_namespace'.
@@ -695,9 +807,13 @@ class AdvancedSettingsForm(forms.ModelForm):
                         if self._check_unique_namespace_instance(application_namespace):
                             # Looks like there's already one with the default instance
                             # namespace defined.
-                            self._errors['application_namespace'] = ErrorList([
-                                _('An application instance with this name already exists.')
-                            ])
+                            self._errors["application_namespace"] = ErrorList(
+                                [
+                                    _(
+                                        "An application instance with this name already exists."
+                                    )
+                                ]
+                            )
                         else:
                             # OK, there are zero instances of THIS app that use the
                             # default instance namespace, so, since the user didn't
@@ -705,30 +821,32 @@ class AdvancedSettingsForm(forms.ModelForm):
                             # line is really setting the "instance namespace" of the
                             # new app to the app’s "application namespace", which is
                             # the default instance namespace.
-                            self.cleaned_data['application_namespace'] = application_namespace
+                            self.cleaned_data[
+                                "application_namespace"
+                            ] = application_namespace
 
         if instance_namespace and not apphook:
-            self.cleaned_data['application_namespace'] = None
+            self.cleaned_data["application_namespace"] = None
 
         if application_config and not apphook:
-            self.cleaned_data['application_configs'] = None
+            self.cleaned_data["application_configs"] = None
         return self.cleaned_data
 
     def clean_xframe_options(self):
-        if 'xframe_options' not in self.fields:
+        if "xframe_options" not in self.fields:
             return  # nothing to do, field isn't present
 
-        xframe_options = self.cleaned_data['xframe_options']
-        if xframe_options == '':
-            return Page._meta.get_field('xframe_options').default
+        xframe_options = self.cleaned_data["xframe_options"]
+        if xframe_options == "":
+            return Page._meta.get_field("xframe_options").default
 
         return xframe_options
 
     def clean_overwrite_url(self):
-        path_override = self.cleaned_data.get('overwrite_url')
+        path_override = self.cleaned_data.get("overwrite_url")
 
         if path_override:
-            path = path_override.strip('/')
+            path = path_override.strip("/")
         else:
             path = self.instance.get_path_for_slug(self.title_obj.slug, self._language)
 
@@ -738,15 +856,15 @@ class AdvancedSettingsForm(forms.ModelForm):
             language=self._language,
             exclude_page=self.instance,
         )
-        self.cleaned_data['path'] = path
+        self.cleaned_data["path"] = path
         return path_override
 
     def has_changed_apphooks(self):
         changed_data = self.changed_data
 
-        if 'application_urls' in changed_data:
+        if "application_urls" in changed_data:
             return True
-        return 'application_namespace' in changed_data
+        return "application_namespace" in changed_data
 
     def update_apphooks(self):
         # User has changed the apphooks on the page.
@@ -765,10 +883,10 @@ class AdvancedSettingsForm(forms.ModelForm):
         page = super(AdvancedSettingsForm, self).save(*args, **kwargs)
         page.update_translations(
             self._language,
-            path=data['path'],
-            redirect=(data.get('redirect') or None),
+            path=data["path"],
+            redirect=(data.get("redirect") or None),
             publisher_state=PUBLISHER_STATE_DIRTY,
-            has_url_overwrite=bool(data.get('overwrite_url')),
+            has_url_overwrite=bool(data.get("overwrite_url")),
         )
         is_draft_and_has_public = page.publisher_is_draft and page.publisher_public_id
 
@@ -779,10 +897,9 @@ class AdvancedSettingsForm(forms.ModelForm):
 
 
 class PagePermissionForm(forms.ModelForm):
-
     class Meta:
         model = Page
-        fields = ['login_required', 'limit_visibility_in_menu']
+        fields = ["login_required", "limit_visibility_in_menu"]
 
     def save(self, *args, **kwargs):
         page = super(PagePermissionForm, self).save(*args, **kwargs)
@@ -797,10 +914,10 @@ class PageTreeForm(forms.Form):
     target = forms.ModelChoiceField(queryset=Page.objects.none(), required=False)
 
     def __init__(self, *args, **kwargs):
-        self.page = kwargs.pop('page')
-        self._site = kwargs.pop('site', Site.objects.get_current())
+        self.page = kwargs.pop("page")
+        self._site = kwargs.pop("site", Site.objects.get_current())
         super(PageTreeForm, self).__init__(*args, **kwargs)
-        self.fields['target'].queryset = Page.objects.drafts().filter(
+        self.fields["target"].queryset = Page.objects.drafts().filter(
             node__site=self._site,
             is_page_type=self.page.is_page_type,
         )
@@ -808,11 +925,11 @@ class PageTreeForm(forms.Form):
     def get_root_nodes(self):
         # TODO: this needs to avoid using the pages accessor directly
         nodes = TreeNode.get_root_nodes()
-        return nodes.exclude(cms_pages__is_page_type=not(self.page.is_page_type))
+        return nodes.exclude(cms_pages__is_page_type=not (self.page.is_page_type))
 
     def get_tree_options(self):
-        position = self.cleaned_data['position']
-        target_page = self.cleaned_data.get('target')
+        position = self.cleaned_data["position"]
+        target_page = self.cleaned_data.get("target")
         parent_node = target_page.node if target_page else None
 
         if parent_node:
@@ -828,12 +945,12 @@ class PageTreeForm(forms.Form):
             # The position requested is not occupied.
             # Add the node as the last root node,
             # relative to the current site.
-            return (siblings.reverse()[0], 'right')
-        return (target_node, 'left')
+            return (siblings.reverse()[0], "right")
+        return (target_node, "left")
 
     def _get_tree_options_for_parent(self, parent_node, position):
         if position == 0:
-            return (parent_node, 'first-child')
+            return (parent_node, "first-child")
 
         siblings = parent_node.get_children().filter(site=self._site)
 
@@ -842,24 +959,26 @@ class PageTreeForm(forms.Form):
         except IndexError:
             # The position requested is not occupied.
             # Add the node to be the parent's first child
-            return (parent_node, 'last-child')
-        return (target_node, 'left')
+            return (parent_node, "last-child")
+        return (target_node, "left")
 
 
 class MovePageForm(PageTreeForm):
-
     def clean(self):
         cleaned_data = super(MovePageForm, self).clean()
 
-        if self.page.is_home and cleaned_data.get('target'):
-            self.add_error('target', force_text(_('You can\'t move the home page inside another page')))
+        if self.page.is_home and cleaned_data.get("target"):
+            self.add_error(
+                "target",
+                force_text(_("You can't move the home page inside another page")),
+            )
         return cleaned_data
 
     def get_tree_options(self):
         options = super(MovePageForm, self).get_tree_options()
         target_node, target_node_position = options
 
-        if target_node_position != 'left':
+        if target_node_position != "left":
             return (target_node, target_node_position)
 
         node = self.page.node
@@ -869,16 +988,16 @@ class MovePageForm(PageTreeForm):
             # The node being moved appears before the target node
             # and is a sibling of the target node.
             # The user is moving from left to right.
-            target_node_position = 'right'
+            target_node_position = "right"
         elif node_is_first:
             # The node being moved appears before the target node
             # but is not a sibling of the target node.
             # The user is moving from right to left.
-            target_node_position = 'left'
+            target_node_position = "left"
         else:
             # The node being moved appears after the target node.
             # The user is moving from right to left.
-            target_node_position = 'left'
+            target_node_position = "left"
         return (target_node, target_node_position)
 
     def move_page(self):
@@ -891,7 +1010,7 @@ class CopyPageForm(PageTreeForm):
 
     def copy_page(self):
         target, position = self.get_tree_options()
-        copy_permissions = self.cleaned_data.get('copy_permissions', False)
+        copy_permissions = self.cleaned_data.get("copy_permissions", False)
         new_page = self.page.copy_with_descendants(
             target_node=target,
             position=position,
@@ -908,14 +1027,14 @@ class CopyPageForm(PageTreeForm):
             # The user is copying a page to a site with no pages
             # Add the node as the last root node.
             siblings = self.get_root_nodes().reverse()
-            return (siblings[0], 'right')
+            return (siblings[0], "right")
 
 
 class ChangeListForm(forms.Form):
     BOOLEAN_CHOICES = (
-        ('', _('All')),
-        ('1', _('Yes')),
-        ('0', _('No')),
+        ("", _("All")),
+        ("1", _("Yes")),
+        ("0", _("No")),
     )
 
     q = forms.CharField(required=False, widget=forms.HiddenInput())
@@ -926,13 +1045,13 @@ class ChangeListForm(forms.Form):
 
     def __init__(self, *args, **kwargs):
         super(ChangeListForm, self).__init__(*args, **kwargs)
-        self.fields['changed_by'].choices = get_page_changed_by_filter_choices()
-        self.fields['template'].choices = get_page_template_filter_choices()
+        self.fields["changed_by"].choices = get_page_changed_by_filter_choices()
+        self.fields["template"].choices = get_page_template_filter_choices()
 
     def is_filtered(self):
         data = self.cleaned_data
 
-        if self.cleaned_data.get('q'):
+        if self.cleaned_data.get("q"):
             return True
         return any(bool(data.get(field.name)) for field in self.visible_fields())
 
@@ -945,13 +1064,12 @@ class ChangeListForm(forms.Form):
 
     def run_filters(self, queryset):
         for field, value in self.get_filter_items():
-            query = {'{}__exact'.format(field): value}
+            query = {"{}__exact".format(field): value}
             queryset = queryset.filter(**query)
         return queryset
 
 
 class BasePermissionAdminForm(forms.ModelForm):
-
     def __init__(self, *args, **kwargs):
         super(BasePermissionAdminForm, self).__init__(*args, **kwargs)
         permission_fields = self._meta.model.get_all_permissions()
@@ -968,16 +1086,17 @@ class PagePermissionInlineAdminForm(BasePermissionAdminForm):
     level or under him in chosen page tree, and users which were created by him,
     but aren't assigned to higher page level than current user.
     """
+
     page = forms.ModelChoiceField(
         queryset=Page.objects.all(),
-        label=_('user'),
+        label=_("user"),
         widget=HiddenInput(),
         required=True,
     )
 
     def __init__(self, *args, **kwargs):
         super(PagePermissionInlineAdminForm, self).__init__(*args, **kwargs)
-        user = get_current_user() # current user from threadlocals
+        user = get_current_user()  # current user from threadlocals
         site = Site.objects.get_current()
         sub_users = get_subordinate_users(user, site)
 
@@ -989,7 +1108,7 @@ class PagePermissionInlineAdminForm(BasePermissionAdminForm):
         # user PKs in limit_choices_to in the query string of the popup we're
         # in danger of causing 414 errors so we fall back to the normal input
         # widget.
-        if get_cms_setting('RAW_ID_USERS'):
+        if get_cms_setting("RAW_ID_USERS"):
             if sub_users.count() < 500:
                 # If there aren't too many users, proceed as normal and use a
                 # raw id field with limit_choices_to
@@ -1007,34 +1126,35 @@ class PagePermissionInlineAdminForm(BasePermissionAdminForm):
         # raw id field for the user
         if use_raw_id:
             from django.contrib.admin.widgets import ForeignKeyRawIdWidget
+
             # This check will be False if the number of users in the system
             # is less than the threshold set by the RAW_ID_USERS setting.
-            if isinstance(self.fields['user'].widget, ForeignKeyRawIdWidget):
+            if isinstance(self.fields["user"].widget, ForeignKeyRawIdWidget):
                 # We can't set a queryset on a raw id lookup, but we can use
                 # the fact that it respects the limit_choices_to parameter.
                 if limit_choices:
-                    self.fields['user'].widget.rel.limit_choices_to = dict(
-                        id__in=list(sub_users.values_list('pk', flat=True))
+                    self.fields["user"].widget.rel.limit_choices_to = dict(
+                        id__in=list(sub_users.values_list("pk", flat=True))
                     )
         else:
-            self.fields['user'].widget = UserSelectAdminWidget()
-            self.fields['user'].queryset = sub_users
-            self.fields['user'].widget.user = user # assign current user
+            self.fields["user"].widget = UserSelectAdminWidget()
+            self.fields["user"].queryset = sub_users
+            self.fields["user"].widget.user = user  # assign current user
 
-        self.fields['group'].queryset = get_subordinate_groups(user, site)
+        self.fields["group"].queryset = get_subordinate_groups(user, site)
 
     class Meta:
         fields = [
-            'user',
-            'group',
-            'can_add',
-            'can_change',
-            'can_delete',
-            'can_publish',
-            'can_change_advanced_settings',
-            'can_change_permissions',
-            'can_move_page',
-            'grant_on',
+            "user",
+            "group",
+            "can_add",
+            "can_change",
+            "can_delete",
+            "can_publish",
+            "can_change_advanced_settings",
+            "can_change_permissions",
+            "can_move_page",
+            "grant_on",
         ]
         model = PagePermission
 
@@ -1042,22 +1162,22 @@ class PagePermissionInlineAdminForm(BasePermissionAdminForm):
 class ViewRestrictionInlineAdminForm(BasePermissionAdminForm):
     page = forms.ModelChoiceField(
         queryset=Page.objects.all(),
-        label=_('user'),
+        label=_("user"),
         widget=HiddenInput(),
         required=True,
     )
     can_view = forms.BooleanField(
-        label=_('can_view'),
+        label=_("can_view"),
         widget=HiddenInput(),
         initial=True,
     )
 
     class Meta:
         fields = [
-            'user',
-            'group',
-            'grant_on',
-            'can_view',
+            "user",
+            "group",
+            "grant_on",
+            "can_view",
         ]
         model = PagePermission
 
@@ -1066,103 +1186,117 @@ class ViewRestrictionInlineAdminForm(BasePermissionAdminForm):
 
 
 class GlobalPagePermissionAdminForm(BasePermissionAdminForm):
-
     class Meta:
         fields = [
-            'user',
-            'group',
-            'can_add',
-            'can_change',
-            'can_delete',
-            'can_publish',
-            'can_change_advanced_settings',
-            'can_change_permissions',
-            'can_move_page',
-            'can_view',
-            'sites',
+            "user",
+            "group",
+            "can_add",
+            "can_change",
+            "can_delete",
+            "can_publish",
+            "can_change_advanced_settings",
+            "can_change_permissions",
+            "can_move_page",
+            "can_view",
+            "sites",
         ]
         model = GlobalPagePermission
 
 
 class GenericCmsPermissionForm(forms.ModelForm):
-    """Generic form for User & Grup permissions in cms
-    """
+    """Generic form for User & Grup permissions in cms"""
+
     _current_user = None
 
-    can_add_page = forms.BooleanField(label=_('Add'), required=False, initial=True)
-    can_change_page = forms.BooleanField(label=_('Change'), required=False, initial=True)
-    can_delete_page = forms.BooleanField(label=_('Delete'), required=False)
+    can_add_page = forms.BooleanField(label=_("Add"), required=False, initial=True)
+    can_change_page = forms.BooleanField(
+        label=_("Change"), required=False, initial=True
+    )
+    can_delete_page = forms.BooleanField(label=_("Delete"), required=False)
 
     # pageuser is for pageuser & group - they are combined together,
     # and read out from PageUser model
-    can_add_pageuser = forms.BooleanField(label=_('Add'), required=False)
-    can_change_pageuser = forms.BooleanField(label=_('Change'), required=False)
-    can_delete_pageuser = forms.BooleanField(label=_('Delete'), required=False)
+    can_add_pageuser = forms.BooleanField(label=_("Add"), required=False)
+    can_change_pageuser = forms.BooleanField(label=_("Change"), required=False)
+    can_delete_pageuser = forms.BooleanField(label=_("Delete"), required=False)
 
-    can_add_pagepermission = forms.BooleanField(label=_('Add'), required=False)
-    can_change_pagepermission = forms.BooleanField(label=_('Change'), required=False)
-    can_delete_pagepermission = forms.BooleanField(label=_('Delete'), required=False)
+    can_add_pagepermission = forms.BooleanField(label=_("Add"), required=False)
+    can_change_pagepermission = forms.BooleanField(label=_("Change"), required=False)
+    can_delete_pagepermission = forms.BooleanField(label=_("Delete"), required=False)
 
     def __init__(self, *args, **kwargs):
-        instance = kwargs.get('instance')
-        initial = kwargs.get('initial') or {}
+        instance = kwargs.get("instance")
+        initial = kwargs.get("initial") or {}
 
         if instance:
             initial = initial or {}
             initial.update(self.populate_initials(instance))
-            kwargs['initial'] = initial
+            kwargs["initial"] = initial
         super(GenericCmsPermissionForm, self).__init__(*args, **kwargs)
 
     def clean(self):
         data = super(GenericCmsPermissionForm, self).clean()
 
         # Validate Page options
-        if not data.get('can_change_page'):
-            if data.get('can_add_page'):
-                message = _("Users can't create a page without permissions "
-                            "to change the created page. Edit permissions required.")
+        if not data.get("can_change_page"):
+            if data.get("can_add_page"):
+                message = _(
+                    "Users can't create a page without permissions "
+                    "to change the created page. Edit permissions required."
+                )
                 raise ValidationError(message)
 
-            if data.get('can_delete_page'):
-                message = _("Users can't delete a page without permissions "
-                            "to change the page. Edit permissions required.")
+            if data.get("can_delete_page"):
+                message = _(
+                    "Users can't delete a page without permissions "
+                    "to change the page. Edit permissions required."
+                )
                 raise ValidationError(message)
 
-            if data.get('can_add_pagepermission'):
-                message = _("Users can't set page permissions without permissions "
-                            "to change a page. Edit permissions required.")
+            if data.get("can_add_pagepermission"):
+                message = _(
+                    "Users can't set page permissions without permissions "
+                    "to change a page. Edit permissions required."
+                )
                 raise ValidationError(message)
 
-            if data.get('can_delete_pagepermission'):
-                message = _("Users can't delete page permissions without permissions "
-                            "to change a page. Edit permissions required.")
+            if data.get("can_delete_pagepermission"):
+                message = _(
+                    "Users can't delete page permissions without permissions "
+                    "to change a page. Edit permissions required."
+                )
                 raise ValidationError(message)
 
         # Validate PagePermission options
-        if not data.get('can_change_pagepermission'):
-            if data.get('can_add_pagepermission'):
-                message = _("Users can't create page permissions without permissions "
-                            "to change the created permission. Edit permissions required.")
+        if not data.get("can_change_pagepermission"):
+            if data.get("can_add_pagepermission"):
+                message = _(
+                    "Users can't create page permissions without permissions "
+                    "to change the created permission. Edit permissions required."
+                )
                 raise ValidationError(message)
 
-            if data.get('can_delete_pagepermission'):
-                message = _("Users can't delete page permissions without permissions "
-                            "to change permissions. Edit permissions required.")
+            if data.get("can_delete_pagepermission"):
+                message = _(
+                    "Users can't delete page permissions without permissions "
+                    "to change permissions. Edit permissions required."
+                )
                 raise ValidationError(message)
 
     def populate_initials(self, obj):
-        """Read out permissions from permission system.
-        """
+        """Read out permissions from permission system."""
         initials = {}
         permission_accessor = get_permission_accessor(obj)
 
         for model in (Page, PageUser, PagePermission):
             name = model.__name__.lower()
             content_type = ContentType.objects.get_for_model(model)
-            permissions = permission_accessor.filter(content_type=content_type).values_list('codename', flat=True)
-            for key in ('add', 'change', 'delete'):
+            permissions = permission_accessor.filter(
+                content_type=content_type
+            ).values_list("codename", flat=True)
+            for key in ("add", "change", "delete"):
                 codename = get_permission_codename(key, model._meta)
-                initials['can_%s_%s' % (key, name)] = codename in permissions
+                initials["can_%s_%s" % (key, name)] = codename in permissions
         return initials
 
     def save(self, commit=True):
@@ -1178,19 +1312,19 @@ class PageUserAddForm(forms.ModelForm):
     user = forms.ModelChoiceField(queryset=User.objects.none())
 
     class Meta:
-        fields = ['user']
+        fields = ["user"]
         model = PageUser
 
     def __init__(self, *args, **kwargs):
         super(PageUserAddForm, self).__init__(*args, **kwargs)
-        self.fields['user'].queryset = self.get_subordinates()
+        self.fields["user"].queryset = self.get_subordinates()
 
     def get_subordinates(self):
         subordinates = get_subordinate_users(self._current_user, self._current_site)
         return subordinates.filter(pageuser__isnull=True)
 
     def save(self, commit=True):
-        user = self.cleaned_data['user']
+        user = self.cleaned_data["user"]
         instance = super(PageUserAddForm, self).save(commit=False)
         instance.created_by = self._current_user
 
@@ -1210,7 +1344,7 @@ class PageUserChangeForm(UserChangeForm):
     _current_user = None
 
     class Meta:
-        fields = '__all__'
+        fields = "__all__"
         model = PageUser
 
     def __init__(self, *args, **kwargs):
@@ -1220,15 +1354,15 @@ class PageUserChangeForm(UserChangeForm):
             # Limit permissions to include only
             # the permissions available to the manager.
             permissions = self.get_available_permissions()
-            self.fields['user_permissions'].queryset = permissions
+            self.fields["user_permissions"].queryset = permissions
 
             # Limit groups to include only those where
             # the manager is a member.
-            self.fields['groups'].queryset = self.get_available_groups()
+            self.fields["groups"].queryset = self.get_available_groups()
 
     def get_available_permissions(self):
         permissions = self._current_user.get_all_permissions()
-        permission_codes = (perm.rpartition('.')[-1] for perm in permissions)
+        permission_codes = (perm.rpartition(".")[-1] for perm in permissions)
         return Permission.objects.filter(codename__in=permission_codes)
 
     def get_available_groups(self):
@@ -1236,10 +1370,9 @@ class PageUserChangeForm(UserChangeForm):
 
 
 class PageUserGroupForm(GenericCmsPermissionForm):
-
     class Meta:
         model = PageUserGroup
-        fields = ('name', )
+        fields = ("name",)
 
     def save(self, commit=True):
         if not self.instance.pk:
@@ -1260,7 +1393,7 @@ class PluginAddValidationForm(forms.Form):
     plugin_type = forms.CharField(required=True)
 
     def clean_plugin_type(self):
-        plugin_type = self.cleaned_data['plugin_type']
+        plugin_type = self.cleaned_data["plugin_type"]
 
         try:
             plugin_pool.get_plugin(plugin_type)
@@ -1277,24 +1410,26 @@ class PluginAddValidationForm(forms.Form):
         if self.errors:
             return data
 
-        language = data['plugin_language']
-        placeholder = data['placeholder_id']
-        parent_plugin = data.get('plugin_parent')
+        language = data["plugin_language"]
+        placeholder = data["placeholder_id"]
+        parent_plugin = data.get("plugin_parent")
 
         if language not in get_language_list():
             message = ugettext("Language must be set to a supported language!")
-            self.add_error('plugin_language', message)
+            self.add_error("plugin_language", message)
             return self.cleaned_data
 
         if parent_plugin:
             if parent_plugin.language != language:
                 message = ugettext("Parent plugin language must be same as language!")
-                self.add_error('plugin_language', message)
+                self.add_error("plugin_language", message)
                 return self.cleaned_data
 
             if parent_plugin.placeholder_id != placeholder.pk:
-                message = ugettext("Parent plugin placeholder must be same as placeholder!")
-                self.add_error('placeholder_id', message)
+                message = ugettext(
+                    "Parent plugin placeholder must be same as placeholder!"
+                )
+                self.add_error("placeholder_id", message)
                 return self.cleaned_data
 
         page = placeholder.page
@@ -1302,10 +1437,7 @@ class PluginAddValidationForm(forms.Form):
 
         try:
             has_reached_plugin_limit(
-                placeholder,
-                data['plugin_type'],
-                language,
-                template=template
+                placeholder, data["plugin_type"], language, template=template
             )
         except PluginLimitReached as error:
             self.add_error(None, force_text(error))
@@ -1321,35 +1453,35 @@ class RequestToolbarForm(forms.Form):
     def clean(self):
         data = self.cleaned_data
 
-        obj_id = data.get('obj_id')
-        obj_type = data.get('obj_type')
+        obj_id = data.get("obj_id")
+        obj_type = data.get("obj_type")
 
         if not bool(obj_id or obj_type):
             return data
 
         if (obj_id and not obj_type) or (obj_type and not obj_id):
-            message = 'Invalid object lookup. Both obj_id and obj_type are required'
+            message = "Invalid object lookup. Both obj_id and obj_type are required"
             raise forms.ValidationError(message)
 
-        app, sep, model = obj_type.rpartition('.')
+        app, sep, model = obj_type.rpartition(".")
 
         try:
             model_class = apps.get_model(app_label=app, model_name=model)
         except LookupError:
-            message = 'Invalid object lookup. Both obj_id and obj_type are required'
+            message = "Invalid object lookup. Both obj_id and obj_type are required"
             raise forms.ValidationError(message)
 
         try:
             generic_obj = model_class.objects.get(pk=obj_id)
         except model_class.DoesNotExist:
-            message = 'Invalid object lookup. Both obj_id and obj_type are required'
+            message = "Invalid object lookup. Both obj_id and obj_type are required"
             raise forms.ValidationError(message)
         else:
-            data['attached_obj'] = generic_obj
+            data["attached_obj"] = generic_obj
         return data
 
     def clean_cms_path(self):
-        path = self.cleaned_data.get('cms_path')
+        path = self.cleaned_data.get("cms_path")
 
         if path:
             validate_relative_url(path)
